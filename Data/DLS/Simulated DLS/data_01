@@ -1,0 +1,5 @@
+# Cluster list (3 data points):
+# "Cluster Identifier" "Cluster Size" "Radius of Gyration" "Gyration Tensor.XX" "Gyration Tensor.YY" "Gyration Tensor.ZZ" "Gyration Tensor.XY" "Gyration Tensor.XZ" "Gyration Tensor.YZ"
+1 998 0.4292267756 0.0611672462 0.0581436001 0.0649247786 0.0020162507 -0.0058314376 -0.0051480871 
+2 1 0.0 0.0 0.0 0.0 0.0 0.0 0.0 
+3 1 0.0 0.0 0.0 0.0 0.0 0.0 0.0 
