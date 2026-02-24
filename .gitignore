@@ -1,1 +1,3 @@
-Data/QENS/Runs_with_100fs_stepsize/
+**/md_whole.xtc
+**/npt.xtc
+**/nvt.xtc

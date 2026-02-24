@@ -1,0 +1,45 @@
+; md.mdp — production MD for dielectric spectroscopy
+integrator      = md
+dt              = 0.002
+nsteps          = 1000000   ; 
+
+; Temperature coupling
+tcoupl          = v-rescale
+tc-grps         = Protein Water_and_ions
+tau_t           = 0.1     0.1
+ref_t           = 230 230
+
+; NO pressure coupling in production (critical for DBS)
+pcoupl          = no
+
+; Constraints
+constraints     = h-bonds
+constraint_algorithm = lincs
+lincs_iter      = 1
+lincs_order     = 4
+
+; Neighbor searching
+cutoff-scheme   = Verlet
+nstlist         = 20
+rlist           = 1.2
+
+; Electrostatics and vdW
+coulombtype     = PME
+rcoulomb        = 1.2
+vdwtype         = Cut-off
+rvdw            = 1.2
+
+; Periodic boundaries
+pbc             = xyz
+
+; Center-of-mass motion removal (IMPORTANT)
+comm-mode       = Linear
+comm-grps       = Protein Water_and_ions
+
+; Output control (high time resolution for DBS)
+nstxout-compressed = 50      ; 0.1 ps
+nstenergy       = 500
+nstlog          = 5000
+
+; Trajectory precision
+compressed-x-precision = 1000
