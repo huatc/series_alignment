@@ -1,4 +1,6 @@
 # series_alignment
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/huatc/series_alignment)
+
 A series alignment algorithm to match molecular simulations with experimental characterization. 
 
 <p align="center">
