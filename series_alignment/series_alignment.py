@@ -75,8 +75,15 @@ def compare_curves(
     # -----------------------
     # Distance metrics
     # -----------------------
+    print(f"Comparing curves with metric: {metric} for {len(q_ref)} points in range [{q_min:.3e}, {q_max:.3e}]")
+    print(f"Experimental intensities: min={I_exp.min():.3e}, max={I_exp.max():.3e}")
+    print(f"Simulated intensities: min={I_sim_resampled.min():.3e}, max={I_sim_resampled.max():.3e}")   
+    print(f"Shape of experimental intensities: {I_exp.shape}, Shape of simulated intensities: {I_sim_resampled.shape}")
     if callable(metric):
         score = metric(I_exp, I_sim_resampled)
+    elif metric == "apdist":
+        q_ref_scaled = (q_ref - q_ref.min()) / (q_ref.max() - q_ref.min())
+        score = shape_distance(q_ref_scaled, I_exp, I_sim_resampled)
     elif metric== "peak_position":
         q_AP = np.linspace(q_ref[0], q_ref[-1], len(q_ref))
         peak_exp = q_AP[np.argmax(I_exp)]
