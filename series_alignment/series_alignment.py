@@ -1,6 +1,40 @@
 import numpy as np
 from scipy.interpolate import interp1d
 
+def process_curves(exp_data, sim_data, q_range=None):
+    q_exp = exp_data[:, 0]
+    I_exp = exp_data[:, 1:]
+
+    q_sim = sim_data[:, 0]
+    I_sim = sim_data[:, 1:]
+
+    q_min = max(q_exp.min(), q_sim.min())
+    q_max = min(q_exp.max(), q_sim.max())
+
+    if q_range is not None:
+        q_min = max(q_min, q_range[0])
+        q_max = min(q_max, q_range[1])
+
+    mask_exp = (q_exp >= q_min) & (q_exp <= q_max)
+    q_ref = q_exp[mask_exp]
+    I_exp = I_exp[mask_exp]
+
+    mask_sim = (q_sim >= q_min) & (q_sim <= q_max)
+    q_sim_crop = q_sim[mask_sim]
+    I_sim_crop = I_sim[mask_sim]
+
+    interp_func = interp1d(
+        q_sim_crop,
+        I_sim_crop,
+        axis=0,
+        kind="linear",
+        bounds_error=False,
+        fill_value="extrapolate",
+    )
+    I_sim_resampled = interp_func(q_ref)
+
+    return q_ref, I_exp, I_sim_resampled
+
 def compare_curves(
     exp_data,
     sim_data,
@@ -28,62 +62,16 @@ def compare_curves(
         I_sim: np.ndarray, shape (N_used, K)
     """
 
-    # Extract q and intensities
-    q_exp = exp_data[:, 0]
-    I_exp = exp_data[:, 1:]
-
-    q_sim = sim_data[:, 0]
-    I_sim = sim_data[:, 1:]
-
-    # Determine common q-range
-    q_min = max(q_exp.min(), q_sim.min())
-    q_max = min(q_exp.max(), q_sim.max())
-
-    if q_range is not None:
-        q_min = max(q_min, q_range[0])
-        q_max = min(q_max, q_range[1])
-
-    # Truncate experimental data
-    mask_exp = (q_exp >= q_min) & (q_exp <= q_max)
-    q_ref = q_exp[mask_exp]
-    I_exp = I_exp[mask_exp]
-
-    # Truncate simulated data
-    mask_sim = (q_sim >= q_min) & (q_sim <= q_max)
-    q_sim_crop = q_sim[mask_sim]
-    I_sim_crop = I_sim[mask_sim]
-
-    if len(q_sim_crop) < 2:
-        raise ValueError("Not enough simulated points for interpolation")
-
-    # Interpolate simulated intensities onto experimental q-grid
-    interp_func = interp1d(
-        q_sim_crop,
-        I_sim_crop,
-        axis=0,
-        kind="linear",
-        bounds_error=False,
-        fill_value="extrapolate",
-    )
-    I_sim_resampled = interp_func(q_ref)
-
-    # Numerical safety
-    eps = 1e-10
-    I_exp = np.clip(I_exp, eps, None)
-    I_sim_resampled = np.clip(I_sim_resampled, eps, None)
-
+    q_ref, I_exp, I_sim_resampled = process_curves(exp_data, sim_data, q_range=q_range)
     # -----------------------
     # Distance metrics
     # -----------------------
-    print(f"Comparing curves with metric: {metric} for {len(q_ref)} points in range [{q_min:.3e}, {q_max:.3e}]")
+    print(f"Comparing curves with metric: {metric} for {len(q_ref)} points in range [{q_ref.min():.3e}, {q_ref.max():.3e}]")
     print(f"Experimental intensities: min={I_exp.min():.3e}, max={I_exp.max():.3e}")
     print(f"Simulated intensities: min={I_sim_resampled.min():.3e}, max={I_sim_resampled.max():.3e}")   
     print(f"Shape of experimental intensities: {I_exp.shape}, Shape of simulated intensities: {I_sim_resampled.shape}")
     if callable(metric):
         score = metric(I_exp, I_sim_resampled)
-    elif metric == "apdist":
-        q_ref_scaled = (q_ref - q_ref.min()) / (q_ref.max() - q_ref.min())
-        score = shape_distance(q_ref_scaled, I_exp, I_sim_resampled)
     elif metric== "peak_position":
         q_AP = np.linspace(q_ref[0], q_ref[-1], len(q_ref))
         peak_exp = q_AP[np.argmax(I_exp)]
