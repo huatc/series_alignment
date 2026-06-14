@@ -1,23 +1,24 @@
-name: series_distance
+name: series_alignment
 channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.11
-  - numpy
-  - scipy
-  - pandas
-  - matplotlib
-  - scikit-learn
-  - seaborn
-  - tqdm
+  - python=3.12
+  - numpy=2.4
+  - pandas=3.0
   - ipykernel
   - ipython
-  - gsd
-  - mdanalysis
-  - netcdf4
-  - h5py
-  - openpyxl
   - pip
   - pip:
-      - pyedr
+      # Core scientific stack (installed via pip in this environment)
+      - scipy==1.17.1
+      - scikit-learn==1.9.0
+      - matplotlib==3.10.9
+      - openpyxl==3.1.5
+      # Amplitude-Phase distance and its dependencies
+      - apdist==1.0.0
+      - funcshape==1.0
+      - warping==1.0
+      # PyTorch backend for the torch amplitude-phase distance / splines
+      - torch==2.12.0
+      - torchcubicspline==0.0.3
