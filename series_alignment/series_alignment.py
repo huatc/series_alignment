@@ -222,3 +222,45 @@ def align_monotone_greedy(cost: np.ndarray):
 
     total = float(sum(cost[i, j] for i, j in enumerate(assignment)))
     return assignment, total
+
+
+
+def align_monotone_linear(cost: np.ndarray):
+    """
+    Linear monotone alignment: matches experimental rows to simulated
+    columns using evenly spaced indices across the full range.
+
+    Parameters
+    ----------
+    cost : (N, M) numpy.ndarray
+        Cost matrix.
+
+    Returns
+    -------
+    assignment : list[int]
+        Simulated column chosen for each experimental row.
+    total_cost : float
+        Sum of costs along the linear alignment.
+    """
+    N, M = cost.shape
+
+    if M < N:
+        raise ValueError("Requires M >= N")
+
+    # Evenly spaced simulated indices from 0 to M-1
+    assignment = np.linspace(0, M - 1, N)
+
+    # Convert to integer indices
+    assignment = np.round(assignment).astype(int)
+
+    # Ensure strict monotonicity (fix rare rounding duplicates)
+    for i in range(1, N):
+        if assignment[i] <= assignment[i - 1]:
+            assignment[i] = assignment[i - 1] + 1
+
+    # Safety clip
+    assignment = np.clip(assignment, 0, M - 1)
+
+    total_cost = float(sum(cost[i, j] for i, j in enumerate(assignment)))
+
+    return assignment.tolist(), total_cost

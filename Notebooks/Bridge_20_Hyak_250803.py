@@ -17,6 +17,7 @@
 
 # %%
 import os
+import re
 import sys
 import glob
 import time
@@ -31,6 +32,7 @@ if 'ipykernel' not in sys.modules:
     matplotlib.use('Agg')
 
 import matplotlib.pyplot as plt                      # noqa: E402
+from matplotlib.colors import Normalize               # noqa: E402
 from scipy.interpolate import CubicSpline            # noqa: E402
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as R
@@ -86,15 +88,51 @@ except ImportError:                     # pragma: no cover
 # NOTE ON COST: each SAXS frame is a full Monte-Carlo scattering calculation
 # (SAXS_MC_SAMPLES below), so wall time per BO iteration scales linearly with
 # this number.  40 frames is ~8x the cost of the old 5-frame average.
-N_SERIES_FRAMES = 40
+N_SERIES_FRAMES = 75
+# Frames at each end of the trajectory that are always taken consecutively.
+# Assembly changes fastest just after the quench and the structure settles at
+# the end, so both ends are sampled densely and the middle is filled evenly.
+N_EDGE_FRAMES = 20
 
 # Objective weights for the two modalities (each already normalized per curve).
-SAXS_WEIGHT = 0.5
-DLS_WEIGHT = 0.5
+#SAXS_WEIGHT = 1.0
+#DLS_WEIGHT = 0.0
 
-# Experimental series sizes
-N_EXP_SAXS = 10
-N_EXP_DLS = 19
+#SAXS_WEIGHT = 30
+#DLS_WEIGHT = 5
+
+SAXS_WEIGHT = 1
+DLS_WEIGHT = 0
+
+# Experimental series sizes.  35 SAXS files exist (10 min each, so the full run
+# reaches 350 min) but assembly stops changing measurably after ~90 min, so only
+# the first 9 are scored.  That ends both series at 90 min, which means every
+# time point in the grid carries a DLS curve and none is scored on SAXS alone.
+N_EXP_SAXS = 9
+N_EXP_DLS = 18
+
+# --- Experimental acquisition times (minutes) ---
+# Each measurement is stamped at the END of its acquisition window: a SAXS frame
+# takes 10 min so the first is complete at t = 10, and a DLS frame takes 5 min so
+# the first is complete at t = 5.  The grids therefore coincide every 10 min.
+#
+# A simulated frame is compared against whichever experimental curves were
+# recorded at the same time, and both modalities share one alignment: a single
+# trajectory cannot sit at two points in its own evolution at once, which is what
+# independent per-modality alignment implied.
+SAXS_START_MIN = 10.0        # first SAXS frame complete at t = 10 min
+SAXS_INTERVAL_MIN = 10.0     # -> 10, 20, ... 100 min for the 10 curves used
+DLS_START_MIN = 5.0          # first DLS frame complete at t = 5 min
+DLS_INTERVAL_MIN = 5.0       # -> 5, 10, ... 90 min for the 18 curves
+TIME_MATCH_TOL_MIN = 1e-6    # tolerance when pairing SAXS and DLS times
+
+# How the two acquisition grids are combined:
+#   'intersection' -> only times where BOTH were measured (t = 10, 20 ... 90),
+#                     giving 9 points each carrying one SAXS and one DLS curve.
+#                     The 5-minute DLS measurements in between are not scored.
+#   'union'        -> every time either was measured (18 points here); the
+#                     intermediate DLS curves contribute on their own.
+TIME_GRID_MODE = 'intersection'
 
 # --- SAXS analysis settings ---
 SAXS_Q_SIM = np.geomspace(0.8, 20, 2000)   # simulation q-grid (sim units)
@@ -118,31 +156,66 @@ DLS_BETA = 0.85
 DLS_TAU = np.logspace(-6, 0, 100)
 DLS_LOG_SIZE_LIM = (1.0, 4.0)   # log10(Rh / nm) comparison window
 
-# One simulation length unit -> metres.  Matches the conversion used in
-# Scripts/dls_apdist.py (Rg_sim * 2.0 * 25 * 2 * 1e-9).
-SIM_LENGTH_TO_M = 2.0 * 25 * 2 * 1e-9
+# One simulation length unit -> metres.  Soft Matter 2025, 21, 9398 (Fig. 8):
+# "one reduced unit is equal to the diameter of the silica nanoparticle (25 nm)".
+# The SAXS path already assumes this (q_phys = q_sim / 260 puts 1 unit at 260 A),
+# so the two modalities now share one length scale.  The old value here,
+# 2.0 * 25 * 2 * 1e-9 = 100 nm, carried two spurious factors of 2 and made the
+# DLS analysis read the same trajectory at 4x the SAXS scale.
+SIM_LENGTH_TO_M = 25e-9
 RG_TO_RH = 1.0 / 0.77           # Rh from Rg, assuming compact/spherical clusters
 
-# Bond cutoff for cluster analysis, as a multiple of the potential minimum r0.
+# The Zetasizer reports an intensity-weighted hydrodynamic DIAMETER, while
+# Stokes-Einstein yields a radius, so the simulated distribution is doubled to
+# put both axes in the same units.  Affects scoring and plots alike.
+DLS_SIM_AS_DIAMETER = True
+
+# Bond cutoff for cluster analysis.  The paper's OVITO analysis used an absolute
+# cutoff of 3.5 reduced units; set CLUSTER_CUTOFF_ABS to None to fall back to
+# CLUSTER_CUTOFF_FACTOR * r0 (the previous behaviour, ~2.9 at r0 = 2.33, which
+# is tighter and splits single aggregates into several counted clusters).
+CLUSTER_CUTOFF_ABS = 3.5
 CLUSTER_CUTOFF_FACTOR = 1.25
 MIN_CLUSTER_SIZE = 2
+# Radius of gyration of a single solid sphere, sqrt(3/5)*R, in simulation units.
+# No cluster can be more compact than one building block, so this is the floor
+# for Rg.  Without it a fully collapsed cluster gives Rg = 0, and build_g2's
+# Stokes-Einstein step (a pure-Python division) raises ZeroDivisionError.
+MONOMER_RG = float(np.sqrt(3.0 / 5.0) * (BUILDING_BLOCK_D / 2.0))
 
 # Shared amplitude-phase distance options (dynamic-programming warp search).
 AP_KWARGS = {"optim": "DP", "grid_dim": 10}
 
+# SAXS distance metric: 'log_mse' (mean squared difference of log10 S(q)) or
+# 'apdist' (elastic amplitude-phase).  DLS always uses the amplitude-phase
+# distance.  Note the two are on very different numeric scales, so SAXS_WEIGHT
+# needs revisiting whenever this changes.
+SAXS_METRIC = 'log_mse'
+# Subtract the mean log residual before squaring, which lets the simulated curve
+# float by one overall scale factor so log_mse grades shape rather than level.
+SAXS_LOG_MSE_MATCH_OFFSET = False
+
 N_DENSE = 100          # points on the common grid used for the AP distance
 FAILED_SCORE = 999.0   # sentinel returned when a candidate cannot be evaluated
+
+# --- Bayesian-optimization settings ---
+MIN_EXPONENT_GAP = 1.0   # smallest |n - m| that is numerically safe
+MIN_GP_POINTS = 3        # successful evaluations needed before fitting a GP
 
 
 # %% [markdown]
 # ## Simulation (HOOMD, Linux/GPU only)
 
 # %%
+
+F_CAP = 1.0e4          # F*dt^2 = 0.01 sigma per step at dt = 1e-3
+
 def modified_LJ(r, rmin, rmax, U_0, n, m, r0):
     """Generalized (n, m) Lennard-Jones potential and force."""
     U = U_0 / (n - m) * (m * (r0 / r) ** n - n * (r0 / r) ** m)
     F = U_0 * m * n * ((r0 / r) ** n - (r0 / r) ** m) / ((n - m) * r)
-    return U, F
+    # Cap the repulsive core so a steep wall cannot eject a particle in one step
+    return np.clip(U, -F_CAP, F_CAP), np.clip(F, -F_CAP, F_CAP)
 
 
 def generate_positions(N, L, min_dist, rng=None):
@@ -179,14 +252,15 @@ def generate_positions(N, L, min_dist, rng=None):
 
 
 def simulation(density, U_0, r0, n, m, save_dir,
-               N=5000, dt=0.001, steps=15_000_000, kT=1.0, gsd_period=50_000):
+               N=1000, dt=0.001, steps=500_000, kT=1.0, gsd_period=1_000):
     """Run Langevin dynamics of N attractive spheres and dump a GSD trajectory."""
     if not _HAS_HOOMD:
         raise RuntimeError(
             "HOOMD is not available: the simulation only runs on Linux/GPU. "
             "Use --check to exercise the scoring pipeline without it.")
 
-    hoomd.context.initialize("--mode=gpu")
+    #hoomd.context.initialize("--mode=gpu")
+    hoomd.context.initialize(os.environ.get('HOOMD_MODE', '--mode=cpu'))
     os.makedirs(save_dir, exist_ok=True)
 
     rmin = 0.75 * r0
@@ -320,16 +394,51 @@ def read_trajectory(filename):
     return positions, lattice_coordinates, box_L
 
 
-def select_frame_indices(n_frames, n_series):
-    """Pick n_series frame indices spread evenly across a trajectory.
+def select_frame_indices(n_frames, n_series, n_edge=N_EDGE_FRAMES):
+    """Pick n_series frames: the first n_edge, the last n_edge, and an even
+    spread of the remainder in between.
 
-    The simulated series must be time-ordered for the monotone alignment to be
-    meaningful, and must be at least as long as the experimental series.
+    Nucleation happens in the first few frames and the structure stops evolving
+    in the last few, so sampling both ends consecutively captures the fast
+    early kinetics and the converged state, while the evenly spaced middle
+    covers the slow growth regime.
+
+    The result is sorted and duplicate-free, so the simulated series stays
+    time-ordered for the monotone alignment. Exactly n_series frames are
+    returned whenever the trajectory is long enough.
     """
-    if n_frames == 0:
+    if n_frames <= 0:
         raise ValueError("Trajectory contains no frames.")
-    idx = np.unique(np.linspace(0, n_frames - 1, min(n_series, n_frames)).astype(int))
-    return idx.tolist()
+
+    n_series = int(min(n_series, n_frames))
+    if n_frames <= n_series:
+        return list(range(n_frames))
+
+    # Never let the two ends overlap or crowd out the middle entirely.
+    n_edge = int(min(n_edge, n_frames // 2, n_series // 2))
+    if n_edge <= 0:
+        return np.unique(
+            np.linspace(0, n_frames - 1, n_series).astype(int)).tolist()
+
+    head = list(range(n_edge))
+    tail = list(range(n_frames - n_edge, n_frames))
+    idx = set(head) | set(tail)
+
+    n_mid = n_series - len(idx)
+    lo, hi = head[-1] + 1, tail[0] - 1
+    if n_mid > 0 and hi >= lo:
+        idx |= {int(v) for v in np.linspace(lo, hi, n_mid).round().astype(int)}
+
+    # Rounding can collapse neighbouring middle frames; top up from whatever is
+    # left so the caller still gets n_series curves.
+    if len(idx) < n_series:
+        spare = [f for f in range(n_frames) if f not in idx]
+        if spare:
+            take = min(n_series - len(idx), len(spare))
+            idx |= {spare[int(round(p))]
+                    for p in np.linspace(0, len(spare) - 1, take)}
+
+    return sorted(idx)
 
 
 # %% [markdown]
@@ -416,9 +525,9 @@ def convert_to_SAXS_series(lattice_coordinates, frame_indices, save_dir,
         simulator.sample_building_block(points)
         simulator.sample_lattice_coordinates(coords)
         simulator.calculate_structure_coordinates()
-        I_q = simulator.simulate_multiple_scattering_curves_lattice_coords(
+        I_q = simulator.simulate_scattering_curve_fast_lattice(
             points, coords, SAXS_HIST_BINS, q_sim, save=False).cpu().numpy()
-        I_q = np.mean(I_q, axis=1)
+        #I_q = np.mean(I_q, axis=1)
 
         S_q = calculate_structure_factor(
             monodisperse_sphere, np.column_stack((q_phys, I_q)),
@@ -519,6 +628,9 @@ def cluster_analysis(positions, box_L, cutoff, min_size=MIN_CLUSTER_SIZE):
         unwrapped = _bfs_unwrap(pos, members, neighbors, box_L)
         com = unwrapped.mean(axis=0)
         rg_sim = np.sqrt(np.mean(np.sum((unwrapped - com) ** 2, axis=1)))
+        # Particles that collapse into the soft core can coincide exactly; floor
+        # Rg at the single-sphere value so Rh stays physical and non-zero.
+        rg_sim = max(float(rg_sim), MONOMER_RG)
         rg_m = rg_sim * SIM_LENGTH_TO_M
         clusters.append({'N': int(len(members)),
                          'Rg': float(rg_m),
@@ -560,6 +672,12 @@ def dls_distribution_from_clusters(clusters):
     _, wD, info = DLS.contin_like_invert(g2, DLS_TAU, q, T=DLS_T, eta=DLS_ETA)
 
     Rh_nm = np.asarray(info["Rh_grid"], dtype=float) * 1e9
+    if DLS_SIM_AS_DIAMETER:
+        # Stokes-Einstein gives a hydrodynamic RADIUS, but the Zetasizer's
+        # intensity-weighted distribution is in hydrodynamic DIAMETER (see the
+        # paper's Methods), so both axes must be diameters before they are
+        # compared.  Applied here so scoring and plotting stay consistent.
+        Rh_nm = 2.0 * Rh_nm
     wD = np.asarray(wD, dtype=float)
 
     # CubicSpline needs strictly increasing x; Rh decreases with D.
@@ -575,7 +693,8 @@ def convert_to_DLS_series(positions, frame_indices, box_L, r0, save_dir, plot=Tr
     out_dir = os.path.join(save_dir, 'dls_data_series')
     os.makedirs(out_dir, exist_ok=True)
 
-    cutoff = CLUSTER_CUTOFF_FACTOR * r0
+    cutoff = (CLUSTER_CUTOFF_ABS if CLUSTER_CUTOFF_ABS is not None
+              else CLUSTER_CUTOFF_FACTOR * r0)
     series, cluster_counts = [], []
 
     for k in frame_indices:
@@ -614,6 +733,35 @@ def convert_to_DLS_series(positions, frame_indices, box_L, r0, save_dir, plot=Tr
 # ## Experimental series
 
 # %%
+def _load_curve(filepath):
+    """Load a 2-column [x, y] .npy curve, tolerating object/pickled arrays."""
+    try:
+        arr = np.load(filepath)
+    except ValueError:
+        # dtype=object file (e.g. np.save on a ragged list) needs pickle to read
+        arr = np.load(filepath, allow_pickle=True)
+
+    # Unwrap 0-d object arrays from np.save(path, <python object>)
+    if arr.dtype == object:
+        if arr.shape == ():
+            arr = arr.item()
+        arr = np.asarray(arr)
+
+    try:
+        arr = np.asarray(arr, dtype=float)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"{os.path.basename(filepath)}: not a numeric array ({exc}). "
+            "Looks ragged/object -- re-save it as a plain (N, 2) float array."
+        ) from exc
+
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        raise ValueError(
+            f"{os.path.basename(filepath)}: expected an (N, 2) [q, I] array, "
+            f"got shape {arr.shape}"
+        )
+    return arr[:, :2]
+
 def load_experimental_saxs(n_curves=N_EXP_SAXS, root=_ROOT, include_no_bridge=False):
     """Load the experimental SAXS kinetic series (already structure factors).
 
@@ -625,13 +773,39 @@ def load_experimental_saxs(n_curves=N_EXP_SAXS, root=_ROOT, include_no_bridge=Fa
     if not include_no_bridge:
         names = [f for f in names if 'no_bridge' not in f]
     names = names[:n_curves]
-    return [np.load(os.path.join(path, f)) for f in names]
+    return [_load_curve(os.path.join(path, f)) for f in names]
+
+
+def _numeric_key(filename):
+    """Sort key from the first integer in a filename.
+
+    Plain sorted() puts data_10 immediately after data_1, which would scramble
+    the kinetic order and silently misalign every curve in time.
+    """
+    match = re.search(r'(\d+)', os.path.basename(filename))
+    return int(match.group(1)) if match else -1
 
 
 def load_experimental_dls(n_samples=N_EXP_DLS, root=_ROOT, n_replicates=3):
-    """Load the experimental DLS kinetic series, averaging replicates per sample."""
-    path = os.path.join(root, 'Data', 'DLS', 'Assembly_kinetics_data.xlsx')
-    data = pd.read_excel(path).values[:, 5:].T.astype(float)
+    """Load the experimental DLS kinetic series as [size_nm, scaled_intensity].
+
+    Prefers the per-time-point arrays in Data/DLS/Kinetics_data, which are the
+    replicate-averaged, MinMax-scaled curves already extracted from the
+    spreadsheet. Falls back to re-deriving them from Assembly_kinetics_data.xlsx
+    if that folder is missing.
+    """
+    path = os.path.join(root, 'Data', 'DLS', 'Kinetics_data')
+    if os.path.isdir(path):
+        names = sorted((f for f in os.listdir(path) if f.endswith('.npy')),
+                       key=_numeric_key)
+        if len(names) < n_samples:
+            raise ValueError(
+                f"{path} holds {len(names)} curves but {n_samples} were "
+                f"requested; lower N_EXP_DLS.")
+        return [_load_curve(os.path.join(path, f)) for f in names[:n_samples]]
+
+    xlsx = os.path.join(root, 'Data', 'DLS', 'Assembly_kinetics_data.xlsx')
+    data = pd.read_excel(xlsx).values[:, 5:].T.astype(float)
 
     sizes = data[1:71, 0].reshape(-1, 1)
     intensity = data[71:, :]
@@ -664,8 +838,12 @@ def _process_saxs_curve(x, y, q_lim=SAXS_Q_LIM, s_lim=SAXS_S_LIM):
     return x_unique, y_log[idx]
 
 
-def shape_distance_saxs(exp_curve, sim_curve, n_dense=N_DENSE):
-    """Amplitude-phase shape distance between two SAXS curves (log-log space)."""
+def _prepare_saxs_pair(exp_curve, sim_curve, n_dense=N_DENSE):
+    """Spline a SAXS pair onto the shared log-q grid the distance is scored on.
+
+    Split out from shape_distance_saxs so the diagnostic plots can draw exactly
+    the curves the metric saw, rather than an independently processed version.
+    """
     ex, ey = _process_saxs_curve(exp_curve[:, 0], exp_curve[:, 1])
     sx, sy = _process_saxs_curve(sim_curve[:, 0], sim_curve[:, 1])
 
@@ -675,24 +853,48 @@ def shape_distance_saxs(exp_curve, sim_curve, n_dense=N_DENSE):
         raise ValueError("Experimental and simulated q-ranges do not overlap.")
 
     x_dense = np.linspace(lo, hi, n_dense)
-    x_scaled = (x_dense - x_dense.min()) / (x_dense.max() - x_dense.min())
-
-    y_exp = CubicSpline(ex, ey)(x_dense)
-    y_sim = CubicSpline(sx, sy)(x_dense)
-
-    amplitude, phase = AmplitudePhaseDistance(x_scaled, y_exp, y_sim, **AP_KWARGS)
-    return float(amplitude + phase)
+    return x_dense, CubicSpline(ex, ey)(x_dense), CubicSpline(sx, sy)(x_dense)
 
 
-def shape_distance_dls(exp_curve, sim_curve, log_size_lim=DLS_LOG_SIZE_LIM,
-                       n_dense=N_DENSE):
-    """Amplitude-phase shape distance between two DLS size distributions.
+def shape_distance_saxs(exp_curve, sim_curve, n_dense=N_DENSE, metric=None):
+    """Distance between two SAXS curves on the shared log-q grid.
 
-    Both curves are splined onto a common log10(size) grid, matching the
-    treatment in Scripts/dls_apdist.py.
+    'log_mse' : mean squared difference of log10 S(q). A plain point-wise
+        comparison -- it penalises a peak that is in the wrong place, which the
+        elastic distance partly forgives by warping the q axis to line peaks up.
+    'apdist'  : amplitude-phase (elastic) distance, the previous default.
+
+    See SAXS_METRIC.
+    """
+    metric = SAXS_METRIC if metric is None else metric
+    x_dense, y_exp, y_sim = _prepare_saxs_pair(exp_curve, sim_curve, n_dense)
+
+    if metric == 'log_mse':
+        # _prepare_saxs_pair already returns log10 S(q), so this is the MSE
+        # in log space; no further transform is needed.
+        residual = y_exp - y_sim
+        if SAXS_LOG_MSE_MATCH_OFFSET:
+            # Remove a constant log offset, i.e. allow the simulated curve to be
+            # rescaled by one factor, so the metric grades shape not scale.
+            residual = residual - residual.mean()
+        return float(np.mean(residual ** 2))
+
+    if metric == 'apdist':
+        x_scaled = (x_dense - x_dense.min()) / (x_dense.max() - x_dense.min())
+        amplitude, phase = AmplitudePhaseDistance(
+            x_scaled, y_exp, y_sim, **AP_KWARGS)
+        return float(amplitude + phase)
+
+    raise ValueError(f"SAXS metric must be 'log_mse' or 'apdist', got {metric!r}")
+
+
+def _prepare_dls_pair(exp_curve, sim_curve, log_size_lim=DLS_LOG_SIZE_LIM,
+                      n_dense=N_DENSE):
+    """Spline a DLS pair onto the common log10(size) grid used for scoring.
+
+    Matches the treatment in Scripts/dls_apdist.py.
     """
     x_dense = np.linspace(log_size_lim[0], log_size_lim[1], n_dense)
-    x_scaled = (x_dense - x_dense.min()) / (x_dense.max() - x_dense.min())
 
     def _spline(curve):
         x = np.log10(np.asarray(curve[:, 0], dtype=float))
@@ -702,11 +904,173 @@ def shape_distance_dls(exp_curve, sim_curve, log_size_lim=DLS_LOG_SIZE_LIM,
         keep = np.concatenate(([True], np.diff(x) > 0))
         return CubicSpline(x[keep], y[keep])(x_dense)
 
-    y_exp = _spline(exp_curve)
-    y_sim = _spline(sim_curve)
+    return x_dense, _spline(exp_curve), _spline(sim_curve)
+
+
+def shape_distance_dls(exp_curve, sim_curve, log_size_lim=DLS_LOG_SIZE_LIM,
+                       n_dense=N_DENSE):
+    """Amplitude-phase shape distance between two DLS size distributions."""
+    x_dense, y_exp, y_sim = _prepare_dls_pair(
+        exp_curve, sim_curve, log_size_lim, n_dense)
+    x_scaled = (x_dense - x_dense.min()) / (x_dense.max() - x_dense.min())
 
     amplitude, phase = AmplitudePhaseDistance(x_scaled, y_exp, y_sim, **AP_KWARGS)
     return float(amplitude + phase)
+
+
+# Acquisition times (minutes) for the experimental series, used to colour the
+# overlay figures.  Leave as None to colour by curve index instead.
+EXP_TIMES_SAXS = None
+EXP_TIMES_DLS = None
+
+# Kept only so older saved figures/labels still resolve; the radius -> diameter
+# conversion now happens in dls_distribution_from_clusters via
+# DLS_SIM_AS_DIAMETER, which affects scoring as well as plotting.
+SIM_RH_TO_DIAMETER = False
+
+# Panels drawn in the overlay figures: SAXS as 3x3 and DLS as 6x3.  Scoring and
+# alignment always use every experimental curve; this only trims the figure.
+OVERLAY_MAX_PANELS = {'saxs': 9, 'dls': 18}
+OVERLAY_NCOLS = 3
+
+# Font sizes for the overlay figures.  Sized for a figure that will be shrunk
+# into a paper column, so the axis and colourbar text stays readable.
+OVERLAY_FONTS = {
+    'axis_label': 24,     # the shared "q (1/A)" / "Intensity" labels
+    'cbar_label': 22,     # "Experimental Data Time (Mins)"
+    'cbar_ticks': 20,     # the numbers up the colourbar
+    'panel_label': 14,    # the "(exp, sim)" tag in each panel
+    'legend': 16,
+    'tick_label': 18,     # axis tick numbers (cost-matrix heatmap)
+    'title': 20,
+}
+
+
+def _overlay_pair(exp_curve, sim_curve, label):
+    """Return (exp_x, exp_y, sim_x, sim_y) in native units for plotting.
+
+    The experimental curve keeps its raw sampling so the scatter shows real
+    measured points; both are cropped to the same window the distance uses.
+    """
+    if label == 'saxs':
+        ex, ey = _process_saxs_curve(exp_curve[:, 0], exp_curve[:, 1])
+        sx, sy = _process_saxs_curve(sim_curve[:, 0], sim_curve[:, 1])
+        return 10 ** ex, 10 ** ey, 10 ** sx, 10 ** sy
+
+    lo, hi = DLS_LOG_SIZE_LIM
+    out = []
+    for curve, is_sim in ((exp_curve, False), (sim_curve, True)):
+        x = np.asarray(curve[:, 0], dtype=float)
+        y = np.asarray(curve[:, 1], dtype=float)
+        # No conversion here: dls_distribution_from_clusters has already put the
+        # simulated curve on the same (diameter) axis as the experiment.
+        keep = (x > 0)
+        x, y = x[keep], y[keep]
+        keep = (np.log10(x) >= lo) & (np.log10(x) <= hi)
+        out += [x[keep], y[keep]]
+    return tuple(out)
+
+
+def plot_alignment_overlay(exp_series, sim_series, idx_cols, save_path, label,
+                           exp_times=None, ncols=OVERLAY_NCOLS, cmap='jet',
+                           annotate=True, max_panels=None,
+                           time_label='Experimental Data Time (Mins)',
+                           panel_size=(3.1, 2.6), fonts=None):
+    """Publication-style overlay of each experimental curve on its match.
+
+    One tightly packed panel per experimental curve: the measured data as
+    scatter points coloured by acquisition time, and the simulated frame the
+    monotone alignment chose as a black line. A shared colourbar maps colour to
+    time, and each panel is annotated with its (experimental, simulated) pair.
+
+    exp_times : sequence of float, optional
+        Acquisition time per experimental curve. When omitted the panels are
+        coloured by curve index and the colourbar is relabelled accordingly.
+    max_panels : int, optional
+        Draw only the first max_panels experimental curves, so the grid comes
+        out a chosen shape (9 for a 3x3 SAXS figure, 18 for a 6x3 DLS one).
+        Scoring and alignment are unaffected -- this trims the figure only.
+    fonts : dict, optional
+        Font sizes, merged over OVERLAY_FONTS. Keys: 'axis_label',
+        'cbar_label', 'cbar_ticks', 'panel_label', 'legend'.
+    """
+    fs = dict(OVERLAY_FONTS)
+    if fonts:
+        fs.update(fonts)
+    n_total = len(exp_series)
+    n = int(min(n_total, max_panels)) if max_panels else n_total
+    ncols = int(min(ncols, n))
+    nrows = int(np.ceil(n / ncols))
+
+    if exp_times is None:
+        times = np.arange(n_total, dtype=float)
+        time_label = 'Experimental curve index'
+    else:
+        times = np.asarray(exp_times, dtype=float)
+        if len(times) != n_total:
+            raise ValueError(
+                f"exp_times has {len(times)} entries but there are "
+                f"{n_total} curves.")
+    times = times[:n]        # colour spans the panels actually shown
+
+    norm = Normalize(vmin=float(times.min()), vmax=float(times.max()))
+    colormap = plt.get_cmap(cmap)
+
+    fig, axes = plt.subplots(
+        nrows, ncols, squeeze=False, sharex=True, sharey=True,
+        figsize=(panel_size[0] * ncols, panel_size[1] * nrows),
+        gridspec_kw={'wspace': 0, 'hspace': 0})
+
+    sim_handle = exp_handle = None
+    for k in range(nrows * ncols):
+        ax = axes[k // ncols][k % ncols]
+        if k >= n:
+            ax.axis('off')
+            continue
+
+        j = int(idx_cols[k])
+        colour = colormap(norm(times[k]))
+        try:
+            ex, ey, sx, sy = _overlay_pair(exp_series[k], sim_series[j], label)
+        except Exception as exc:
+            ax.text(0.5, 0.5, f'failed:\n{exc}', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=7, color='crimson')
+            continue
+
+        exp_handle = ax.scatter(ex, ey, s=12, color=colour, zorder=2)
+        sim_handle, = ax.plot(sx, sy, color='k', lw=2.2, zorder=3)
+
+        ax.set_xscale('log')
+        if label == 'saxs':
+            ax.set_yscale('log')
+        if annotate:
+            ax.text(0.03, 0.94, f'({k + 1}, {j})', transform=ax.transAxes,
+                    fontsize=fs['panel_label'], va='top', ha='left')
+        ax.tick_params(direction='in', which='both', labelbottom=False,
+                       labelleft=False, top=True, right=True)
+
+    if label == 'saxs':
+        xlabel, ylabel = r'q ($\mathrm{\AA}^{-1}$)', 'Intensity (arb. unit)'
+    else:
+        size = 'Hydrodynamic Diameter' if DLS_SIM_AS_DIAMETER else 'Hydrodynamic Radius'
+        xlabel, ylabel = f'{size} (nm)', 'Intensity (arb. unit)'
+    fig.supxlabel(xlabel, fontsize=fs['axis_label'])
+    fig.supylabel(ylabel, fontsize=fs['axis_label'])
+
+    handles = [h for h in (sim_handle, exp_handle) if h is not None]
+    if handles:
+        fig.legend(handles, ['Simulated data', 'Experimental data'][:len(handles)],
+                   loc='upper center', bbox_to_anchor=(0.5, 1.0),
+                   ncol=2, fontsize=fs['legend'], frameon=True)
+
+    sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.04, pad=0.02)
+    cbar.set_label(time_label, fontsize=fs['cbar_label'])
+    cbar.ax.tick_params(labelsize=fs['cbar_ticks'])
+
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
 
 def build_cost_matrix(exp_series, sim_series, distance_fn, label='', verbose=True):
@@ -724,27 +1088,103 @@ def build_cost_matrix(exp_series, sim_series, distance_fn, label='', verbose=Tru
     return cost
 
 
-def plot_alignment_with_cost(cost_matrix, idx_ap, idx_reference, save_path,
-                            title=None):
-    """Heatmap of the cost matrix with the alignment paths overlaid."""
+def plot_alignment_with_cost(cost_matrix, idx_ap, save_path, title=None,
+                             fonts=None, figsize=(15, 4.5)):
+    """Heatmap of the cost matrix with the alignment path overlaid.
+
+    Font sizes come from OVERLAY_FONTS so this matches the overlay figures;
+    pass `fonts` to override individual keys. The default figure is taller than
+    the original 15x3 so the enlarged axis and colourbar text has room.
+    """
+    fs = dict(OVERLAY_FONTS)
+    if fonts:
+        fs.update(fonts)
+
     exp_indices = np.arange(cost_matrix.shape[0])
 
-    plt.figure(figsize=(15, 3))
-    plt.imshow(cost_matrix, aspect='auto', origin='lower')
-    plt.colorbar(label="Distance", aspect=7)
-    plt.plot(np.asarray(idx_ap), exp_indices, marker='o', color='red',
-             label='Monotone alignment')
-    if idx_reference is not None:
-        plt.plot(np.asarray(idx_reference), exp_indices, marker='o', color='white',
-                 label='Linear alignment')
-    plt.xlabel("Simulated frame index")
-    plt.ylabel("Exp. index")
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(cost_matrix, aspect='auto', origin='lower')
+
+    cbar = fig.colorbar(im, ax=ax, aspect=7)
+    cbar.set_label("Distance", fontsize=fs['cbar_label'])
+    cbar.ax.tick_params(labelsize=fs['cbar_ticks'])
+
+    ax.plot(np.asarray(idx_ap), exp_indices, marker='o', color='red',
+            label='Monotone alignment')
+    ax.set_xlabel("Simulated frame index", fontsize=fs['axis_label'])
+    ax.set_ylabel("Exp. index", fontsize=fs['axis_label'])
+    ax.tick_params(labelsize=fs['tick_label'])
     if title:
-        plt.title(title)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=600, bbox_inches="tight")
-    plt.close()
+        ax.set_title(title, fontsize=fs['title'])
+    ax.legend(fontsize=fs['legend'])
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=600, bbox_inches="tight")
+    plt.close(fig)
+
+
+# Per-modality curve preparation and axis labels, used by the diagnostic plots.
+CURVE_AXES = {
+    'saxs': (_prepare_saxs_pair,
+             r'$\log_{10}\,q\ (\mathrm{\AA}^{-1})$',
+             r'$\log_{10}\,S(q)$'),
+    'dls': (_prepare_dls_pair,
+            r'$\log_{10}\,R_h\ (\mathrm{nm})$',
+            'Normalized intensity'),
+}
+
+
+def plot_aligned_curves(exp_series, sim_series, idx_cols, cost, save_path, label,
+                        score=None, ncols=5):
+    """Overlay every experimental curve on the simulated frame it matched.
+
+    One panel per experimental curve, drawn in exactly the space the
+    amplitude-phase distance saw them (splined onto the shared dense grid), so
+    the panels explain the numbers in the cost matrix rather than approximating
+    them. Panel titles carry the pairing and its distance.
+    """
+    prepare, xlabel, ylabel = CURVE_AXES[label]
+    n = len(exp_series)
+    ncols = int(min(ncols, n))
+    nrows = int(np.ceil(n / ncols))
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.4 * ncols, 2.9 * nrows),
+                             squeeze=False)
+    for k in range(nrows * ncols):
+        ax = axes[k // ncols][k % ncols]
+        if k >= n:
+            ax.axis('off')
+            continue
+
+        j = int(idx_cols[k])
+        try:
+            x, y_exp, y_sim = prepare(exp_series[k], sim_series[j])
+        except Exception as exc:                       # keep one bad pair local
+            ax.text(0.5, 0.5, f'failed:\n{exc}', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=7, color='crimson')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f'exp {k}  <-  sim {j}', fontsize=9)
+            continue
+
+        ax.plot(x, y_exp, color='k', lw=2.0, label='experiment')
+        ax.plot(x, y_sim, color='crimson', lw=1.6, ls='--', label='simulation')
+        ax.set_title(f'exp {k}  <-  sim {j}   d = {cost[k, j]:.3f}', fontsize=9)
+        ax.tick_params(labelsize=7)
+        if k % ncols == 0:
+            ax.set_ylabel(ylabel, fontsize=8)
+        if k // ncols == nrows - 1:
+            ax.set_xlabel(xlabel, fontsize=8)
+        if k == 0:
+            ax.legend(fontsize=7, frameon=False)
+
+    title = f'{label.upper()} aligned pairs'
+    if score is not None:
+        title += f'   (aligned cost/curve = {score:.4f})'
+    fig.suptitle(title, fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
 
 
 def score_series(exp_series, sim_series, distance_fn, save_dir, label):
@@ -766,7 +1206,6 @@ def score_series(exp_series, sim_series, distance_fn, save_dir, label):
 
     cost = build_cost_matrix(exp_series, sim_series, distance_fn, label=label)
     idx_cols, total_cost = series_alignment.align_monotone_min(cost)
-    idx_linear, _ = series_alignment.align_monotone_linear(cost)
 
     score = total_cost / len(exp_series)
 
@@ -778,21 +1217,251 @@ def score_series(exp_series, sim_series, distance_fn, save_dir, label):
                  ).to_csv(os.path.join(save_dir, f'{label}_alignment.csv'),
                           index=False)
     plot_alignment_with_cost(
-        cost, idx_cols, idx_linear,
+        cost, idx_cols,
         os.path.join(save_dir, f'{label}_alignment.png'),
         title=f'{label.upper()} series alignment (score {score:.4f})')
+    plot_aligned_curves(
+        exp_series, sim_series, idx_cols, cost,
+        os.path.join(save_dir, f'{label}_aligned_curves.png'),
+        label, score=score)
+    plot_alignment_overlay(
+        exp_series, sim_series, idx_cols,
+        os.path.join(save_dir, f'{label}_overlay.png'), label,
+        exp_times=EXP_TIMES_SAXS if label == 'saxs' else EXP_TIMES_DLS,
+        max_panels=OVERLAY_MAX_PANELS.get(label))
 
     print(f"  {label}: aligned cost/curve = {score:.4f}, path = {idx_cols}")
     return score, idx_cols, cost
 
 
 # %% [markdown]
+# ## Joint (time-matched) scoring
+#
+# SAXS and DLS were measured on the same sample at known times, so a simulated
+# frame must be compared with the experimental curves recorded at the *same*
+# time and both modalities must share one alignment.
+
+# %%
+def experimental_times(n_curves, start, interval):
+    """Acquisition time of each experimental curve, in minutes."""
+    return start + interval * np.arange(int(n_curves), dtype=float)
+
+
+def build_time_grid(n_saxs, n_dls,
+                    saxs_start=SAXS_START_MIN, saxs_interval=SAXS_INTERVAL_MIN,
+                    dls_start=DLS_START_MIN, dls_interval=DLS_INTERVAL_MIN,
+                    tol=TIME_MATCH_TOL_MIN, mode=None):
+    """Time points at which the simulation is compared with experiment.
+
+    Returns a list of (time_min, saxs_index or None, dls_index or None).
+
+    With SAXS on 10-minute and DLS on 5-minute intervals, 'intersection' keeps
+    the 10-minute marks where both were measured -- one SAXS and one DLS curve
+    per point -- while 'union' also keeps the intervening DLS-only points.
+    See TIME_GRID_MODE.
+    """
+    mode = TIME_GRID_MODE if mode is None else mode
+    if mode not in ('intersection', 'union'):
+        raise ValueError(f"mode must be 'intersection' or 'union', got {mode!r}")
+
+    t_saxs = experimental_times(n_saxs, saxs_start, saxs_interval)
+    t_dls = experimental_times(n_dls, dls_start, dls_interval)
+
+    grid = []
+    for t in np.unique(np.concatenate([t_saxs, t_dls])):
+        i = np.flatnonzero(np.abs(t_saxs - t) <= tol)
+        j = np.flatnonzero(np.abs(t_dls - t) <= tol)
+        i = int(i[0]) if i.size else None
+        j = int(j[0]) if j.size else None
+        if mode == 'intersection' and (i is None or j is None):
+            continue
+        grid.append((float(t), i, j))
+
+    if not grid:
+        raise ValueError(
+            "No usable time points. Check SAXS_START_MIN / SAXS_INTERVAL_MIN "
+            "against DLS_START_MIN / DLS_INTERVAL_MIN -- under 'intersection' "
+            "the two grids must actually coincide somewhere.")
+    return grid
+
+
+def build_joint_cost_matrix(exp_saxs, exp_dls, sim_saxs, sim_dls, time_grid,
+                            saxs_weight=SAXS_WEIGHT, dls_weight=DLS_WEIGHT,
+                            normalize_rows=True, verbose=True):
+    """Cost of matching each experimental *time point* to each simulated frame.
+
+    Both modalities are scored against the same simulated frame, so the two
+    simulated series must be parallel -- element k of each must come from the
+    same trajectory frame.
+
+    Rows are normalized by the weight actually present, so a time point carrying
+    only DLS is not systematically cheaper than one carrying both and therefore
+    does not bias the alignment path.
+
+    Returns (cost, saxs_part, dls_part) where the parts hold the raw per-modality
+    distances (NaN where that modality was not measured at that time).
+    """
+    n_sim = len(sim_saxs)
+    if len(sim_dls) != n_sim:
+        raise ValueError(
+            f"Simulated series must be parallel: {n_sim} SAXS frames vs "
+            f"{len(sim_dls)} DLS frames.")
+
+    n_t = len(time_grid)
+    cost = np.zeros((n_t, n_sim))
+    saxs_part = np.full((n_t, n_sim), np.nan)
+    dls_part = np.full((n_t, n_sim), np.nan)
+    start = time.time()
+
+    for r, (t, i_saxs, i_dls) in enumerate(time_grid):
+        row = np.zeros(n_sim)
+        w_total = 0.0
+        if i_saxs is not None:
+            d = np.array([shape_distance_saxs(exp_saxs[i_saxs], s)
+                          for s in sim_saxs])
+            saxs_part[r] = d
+            row += saxs_weight * d
+            w_total += saxs_weight
+        if i_dls is not None:
+            d = np.array([shape_distance_dls(exp_dls[i_dls], s)
+                          for s in sim_dls])
+            dls_part[r] = d
+            row += dls_weight * d
+            w_total += dls_weight
+        if w_total == 0.0:
+            raise ValueError(f"No experimental data at t = {t} min.")
+        cost[r] = row / w_total if normalize_rows else row
+
+    if verbose:
+        both = sum(1 for _, i, j in time_grid if i is not None and j is not None)
+        print(f"  joint cost matrix {cost.shape} in {time.time() - start:.1f}s "
+              f"({both}/{n_t} time points carry both modalities, "
+              f"min {cost.min():.4f}, max {cost.max():.4f})")
+    return cost, saxs_part, dls_part
+
+
+def score_series_joint(exp_saxs, exp_dls, sim_saxs, sim_dls, save_dir,
+                       time_grid=None, frame_indices=None):
+    """Align both modalities to the simulation on a shared experimental clock.
+
+    Returns
+    -------
+    score : float
+        Aligned cost per experimental time point.
+    idx_cols : list[int]
+        Simulated frame matched to each time point.
+    info : dict
+        Cost matrices, the time grid and the per-modality score breakdown.
+    """
+    if time_grid is None:
+        time_grid = build_time_grid(len(exp_saxs), len(exp_dls))
+
+    if len(sim_saxs) < len(time_grid):
+        raise ValueError(
+            f"Need at least as many simulated frames as experimental time "
+            f"points ({len(sim_saxs)} < {len(time_grid)}); raise "
+            f"N_SERIES_FRAMES or shorten the experimental series.")
+
+    cost, saxs_part, dls_part = build_joint_cost_matrix(
+        exp_saxs, exp_dls, sim_saxs, sim_dls, time_grid)
+    idx_cols, total_cost = series_alignment.align_monotone_min(cost)
+    score = total_cost / len(time_grid)
+
+    # Per-modality means along the shared path, for reporting only.
+    chosen = [(r, int(j)) for r, j in enumerate(idx_cols)]
+    saxs_vals = [saxs_part[r, j] for r, j in chosen if not np.isnan(saxs_part[r, j])]
+    dls_vals = [dls_part[r, j] for r, j in chosen if not np.isnan(dls_part[r, j])]
+    saxs_mean = float(np.mean(saxs_vals)) if saxs_vals else float('nan')
+    dls_mean = float(np.mean(dls_vals)) if dls_vals else float('nan')
+
+    os.makedirs(save_dir, exist_ok=True)
+    np.save(os.path.join(save_dir, 'joint_cost_matrix.npy'), cost)
+
+    rows = []
+    for r, (t, i_saxs, i_dls) in enumerate(time_grid):
+        j = int(idx_cols[r])
+        rows.append({
+            'time_min': t,
+            'saxs_index': i_saxs, 'dls_index': i_dls,
+            'sim_frame_index': j,
+            'sim_frame': None if frame_indices is None else int(frame_indices[j]),
+            'saxs_distance': saxs_part[r, j],
+            'dls_distance': dls_part[r, j],
+            'combined': cost[r, j]})
+    pd.DataFrame(rows).to_csv(
+        os.path.join(save_dir, 'joint_alignment.csv'), index=False)
+
+    plot_alignment_with_cost(
+        cost, idx_cols, os.path.join(save_dir, 'joint_alignment.png'),
+        title=f'Time-matched SAXS + DLS alignment (score {score:.4f})')
+
+    # Per-modality figures, both driven by the one shared path.
+    for label, part, exp_series, sim_series in (
+            ('saxs', saxs_part, exp_saxs, sim_saxs),
+            ('dls', dls_part, exp_dls, sim_dls)):
+        key = 1 if label == 'saxs' else 2
+        pairs = [(g[key], int(idx_cols[r]), g[0])
+                 for r, g in enumerate(time_grid) if g[key] is not None]
+        if not pairs:
+            continue
+        sub_exp = [exp_series[i] for i, _, _ in pairs]
+        sub_idx = [j for _, j, _ in pairs]
+        sub_times = [t for _, _, t in pairs]
+        sub_cost = np.array(
+            [[part[r, jj] for jj in range(cost.shape[1])]
+             for r, g in enumerate(time_grid) if g[key] is not None])
+
+        plot_aligned_curves(
+            sub_exp, sim_series, sub_idx, sub_cost,
+            os.path.join(save_dir, f'{label}_aligned_curves.png'),
+            label, score=saxs_mean if label == 'saxs' else dls_mean)
+        plot_alignment_overlay(
+            sub_exp, sim_series, sub_idx,
+            os.path.join(save_dir, f'{label}_overlay.png'), label,
+            exp_times=sub_times, max_panels=OVERLAY_MAX_PANELS.get(label))
+
+    print(f"  joint: cost/time-point = {score:.4f} "
+          f"(SAXS {saxs_mean:.4f}, DLS {dls_mean:.4f})")
+    print(f"  path = {[int(j) for j in idx_cols]}")
+    return score, idx_cols, {
+        'cost': cost, 'saxs_part': saxs_part, 'dls_part': dls_part,
+        'time_grid': time_grid, 'saxs_mean': saxs_mean, 'dls_mean': dls_mean}
+
+
+# %% [markdown]
 # ## Objective
 
 # %%
+
+    
+def bo_params_to_physical(values, param_names):
+    """Map the optimizer's parameters onto simulation()'s (density, U_0, r0, n, m).
+
+    The (n, m) potential is symmetric under swapping n and m, and singular at
+    n == m.  Searching both independently therefore wastes half the domain on
+    mirror-image duplicates and puts a 0/0 singularity in the middle of it.
+    When the optimizer searches 'm' and 'gap' instead, n = m + gap reaches every
+    distinct potential exactly once and the singularity becomes unreachable.
+
+    Both parametrizations are accepted so older runs remain reproducible.
+    """
+    p = dict(zip(list(param_names), np.asarray(values, dtype=float).flatten()))
+    if 'gap' in p:
+        m = p['m']
+        n = m + p['gap']
+    else:
+        n, m = p['n'], p['m']
+    return p['Density'], p['U_0'], p['r0'], float(n), float(m)
+
+
 def objective(Experiment_Name, iteration, Sample, param_names, *simulation_inputs,
               exp_saxs=None, exp_dls=None):
-    """Simulate one candidate potential and score it against both data series."""
+    """Simulate one candidate potential and score it against both data series.
+
+    Experiment_Name is the directory everything for this evaluation is written
+    under. run_optimization passes the per-run folder from make_run_dir, so
+    repeated runs never overwrite each other.
+    """
     # Accept a single tensor/array/list as well as separate floats.
     if len(simulation_inputs) == 1 and isinstance(
             simulation_inputs[0], (np.ndarray, list, tuple)):
@@ -808,15 +1477,25 @@ def objective(Experiment_Name, iteration, Sample, param_names, *simulation_input
         raise ValueError(
             f"Expected {len(param_names)} parameters but got {len(simulation_inputs)}.")
 
-    params = dict(zip(param_names, simulation_inputs))
+    searched = dict(zip(list(param_names), simulation_inputs))
+    density, U_0, r0, n, m = bo_params_to_physical(simulation_inputs, param_names)
+
+    # Unreachable under the (m, gap) parametrization; kept so runs that still
+    # search n and m independently stay safe.
+    if abs(n - m) < MIN_EXPONENT_GAP:
+        print(f"Rejecting |n-m| = {abs(n - m):.3f}: too close to the 0/0 "
+              f"singularity in U_0/(n-m)")
+        return FAILED_SCORE
 
     sample_dir = os.path.join(Experiment_Name, 'Optimization_Results',
                               f'Sample_{Sample}')
     os.makedirs(sample_dir, exist_ok=True)
-    pd.DataFrame([simulation_inputs], columns=param_names).to_csv(
+    record = dict(searched)
+    record.update({'n_derived': n, 'm_derived': m})
+    pd.DataFrame([record]).to_csv(
         os.path.join(sample_dir, 'input_params.csv'), index=False)
 
-    param_strs = [f"{name}_{np.round(val, 5)}" for name, val in params.items()]
+    param_strs = [f"{name}_{np.round(val, 5)}" for name, val in searched.items()]
     save_dir = os.path.join(sample_dir, "_".join(param_strs))
     os.makedirs(save_dir, exist_ok=True)
 
@@ -826,7 +1505,7 @@ def objective(Experiment_Name, iteration, Sample, param_names, *simulation_input
         exp_dls = load_experimental_dls()
 
     try:
-        gsd_file = simulation(*simulation_inputs, save_dir)
+        gsd_file = simulation(density, U_0, r0, n, m, save_dir)
         if gsd_file is None or not os.path.exists(gsd_file):
             gsd_file = find_gsd_file(save_dir)
 
@@ -839,18 +1518,17 @@ def objective(Experiment_Name, iteration, Sample, param_names, *simulation_input
 
         print('Converting simulation to a DLS series')
         sim_dls = convert_to_DLS_series(positions, frame_indices, box_L,
-                                       params['r0'], save_dir)
+                                       r0, save_dir)
 
-        print('Aligning against the experimental series')
-        saxs_score, _, _ = score_series(exp_saxs, sim_saxs, shape_distance_saxs,
-                                        save_dir, 'saxs')
-        dls_score, _, _ = score_series(exp_dls, sim_dls, shape_distance_dls,
-                                       save_dir, 'dls')
+        print('Aligning against the experimental series (shared clock)')
+        score, idx_cols, info = score_series_joint(
+            exp_saxs, exp_dls, sim_saxs, sim_dls, save_dir,
+            frame_indices=frame_indices)
 
-        score = SAXS_WEIGHT * saxs_score + DLS_WEIGHT * dls_score
-
-        pd.DataFrame([{'saxs_score': saxs_score, 'dls_score': dls_score,
+        pd.DataFrame([{'saxs_score': info['saxs_mean'],
+                       'dls_score': info['dls_mean'],
                        'saxs_weight': SAXS_WEIGHT, 'dls_weight': DLS_WEIGHT,
+                       'n_time_points': len(info['time_grid']),
                        'score': score}]).to_csv(
             os.path.join(save_dir, 'scores.csv'), index=False)
         print('Score: ', score)
@@ -872,13 +1550,41 @@ def scale_to_range(x_scaled, mins, maxs):
     return mins + x_scaled * (maxs - mins)
 
 
-def run_optimization(Experiment_Name='20_Bridge_250803', n_iters=100,
-                     param_names=('Density', 'U_0', 'r0', 'n', 'm'),
-                     target_mins=(0.00005, 0.1, 2.15, 1, 1),
-                     target_maxs=(0.005, 150, 2.25, 30, 30)):
-    """Minimize the combined SAXS + DLS series-alignment cost with BoTorch."""
+def make_run_dir(experiment_name):
+    """Create a fresh timestamped directory under experiment_name.
+
+    Every invocation gets its own folder, so re-running never overwrites the
+    trajectories, scores or plots of a previous run. A counter is appended if
+    two runs start within the same second.
+    """
+    stamp = time.strftime('%Y%m%d_%H%M%S')
+    run_dir = os.path.join(experiment_name, f'run_{stamp}')
+    suffix = 0
+    while os.path.exists(run_dir):
+        suffix += 1
+        run_dir = os.path.join(experiment_name, f'run_{stamp}_{suffix}')
+    os.makedirs(run_dir)
+    return run_dir
+
+
+def run_optimization(Experiment_Name='20_Bridge_250803', n_iters=20, n_init=3,
+                     param_names=('Density', 'U_0', 'r0', 'm', 'gap'),
+                     target_mins=(0.00005, 0.1, 2.20, 1, 2),
+                     target_maxs=(0.005, 300, 2.30, 30, 30)):
+    """Minimize the combined SAXS + DLS series-alignment cost with BoTorch.
+
+    The exponents are searched as 'm' and 'gap', with n = m + gap; see
+    bo_params_to_physical for why. gap >= 2 keeps the potential away from the
+    n == m singularity, and n therefore spans [3, 30] as before.
+
+    Failed evaluations are recorded but excluded from the GP training set: the
+    FAILED_SCORE sentinel is ~300x larger than a real score, so fitting on it
+    destroys the length scales and flattens the acquisition surface. Until
+    MIN_GP_POINTS successes exist the loop samples at random instead.
+    """
     import torch
     from botorch.models import SingleTaskGP
+    from botorch.models.transforms import Standardize
     from botorch.acquisition import qLogExpectedImprovement
     from botorch.optim.optimize import optimize_acqf
     from gpytorch.kernels import ScaleKernel, RBFKernel
@@ -893,18 +1599,36 @@ def run_optimization(Experiment_Name='20_Bridge_250803', n_iters=100,
     bounds = torch.tensor([[0.0] * len(param_names), [1.0] * len(param_names)],
                           dtype=dtype)
 
-    results_dir = os.path.join(Experiment_Name, 'Optimization_Results')
+    # Each run writes into its own timestamped folder; nothing is overwritten.
+    run_dir = make_run_dir(Experiment_Name)
+    results_dir = os.path.join(run_dir, 'Optimization_Results')
     os.makedirs(results_dir, exist_ok=True)
+    print(f"Run directory: {run_dir}")
+
+    pd.DataFrame([{
+        'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'n_iters': n_iters, 'n_init': n_init,
+        'param_names': ' '.join(param_names),
+        'target_mins': ' '.join(str(v) for v in target_mins.tolist()),
+        'target_maxs': ' '.join(str(v) for v in target_maxs.tolist()),
+        'N_SERIES_FRAMES': N_SERIES_FRAMES, 'N_EDGE_FRAMES': N_EDGE_FRAMES,
+        'saxs_weight': SAXS_WEIGHT, 'dls_weight': DLS_WEIGHT,
+        'hoomd_mode': os.environ.get('HOOMD_MODE', '--mode=cpu'),
+    }]).to_csv(os.path.join(run_dir, 'run_config.csv'), index=False)
 
     # Load the experimental series once and reuse for every candidate.
     exp_saxs = load_experimental_saxs()
     exp_dls = load_experimental_dls()
     print(f"Experimental series: {len(exp_saxs)} SAXS curves, "
           f"{len(exp_dls)} DLS curves")
-    if N_SERIES_FRAMES < max(len(exp_saxs), len(exp_dls)):
+    time_grid = build_time_grid(len(exp_saxs), len(exp_dls))
+    both = sum(1 for _, i, j in time_grid if i is not None and j is not None)
+    print(f"Time grid: {len(time_grid)} points from {time_grid[0][0]:.0f} to "
+          f"{time_grid[-1][0]:.0f} min ({both} carry SAXS + DLS)")
+    if N_SERIES_FRAMES < len(time_grid):
         raise ValueError(
-            f"N_SERIES_FRAMES ({N_SERIES_FRAMES}) must be >= the longest "
-            f"experimental series ({max(len(exp_saxs), len(exp_dls))}).")
+            f"N_SERIES_FRAMES ({N_SERIES_FRAMES}) must be >= the number of "
+            f"experimental time points ({len(time_grid)}).")
 
     def fit_gpytorch_model_with_adam(mll, lr=0.01, steps=100):
         mll.train()
@@ -920,45 +1644,62 @@ def run_optimization(Experiment_Name='20_Bridge_250803', n_iters=100,
         mll.model.eval()
 
     # === Initial design ===
-    train_x = torch.rand(1, len(param_names), dtype=dtype)
+    n_init = max(1, min(int(n_init), n_iters))
+    train_x = torch.rand(n_init, len(param_names), dtype=dtype)
     y_values = []
     for i, x in enumerate(train_x):
         x_physical = scale_to_range(x, target_mins, target_maxs)
-        print('Inputs: ', x_physical)
-        y_values.append(objective(Experiment_Name, 0, i, param_names,
+        print(f'Initial design {i + 1}/{n_init}: {x_physical.tolist()}')
+        y_values.append(objective(run_dir, 0, i, param_names,
                                   *x_physical, exp_saxs=exp_saxs, exp_dls=exp_dls))
     train_y = torch.tensor(y_values, dtype=dtype).unsqueeze(-1)
 
     best_score_lst = [float(train_y.min())]
 
     # === BO loop ===
-    for i in range(1, n_iters):
-        neg_train_y = -train_y
+    for i in range(n_init, n_iters):
+        # Fit on successful evaluations only; sentinels would dominate the fit.
+        ok = train_y.squeeze(-1) != FAILED_SCORE
+        n_ok = int(ok.sum())
+        can_fit = n_ok >= MIN_GP_POINTS and float(train_y[ok].std()) > 1e-9
 
-        kernel = ScaleKernel(
-            RBFKernel(ard_num_dims=len(param_names),
-                      lengthscale_constraint=GreaterThan(1e-3)),
-            outputscale_constraint=GreaterThan(1e-3))
-        likelihood = GaussianLikelihood(noise_constraint=GreaterThan(1e-4))
+        if not can_fit:
+            reason = (f"only {n_ok} successful evaluation(s)" if n_ok < MIN_GP_POINTS
+                      else "successful scores are all identical")
+            print(f"  {reason}; sampling at random instead of fitting a GP")
+            new_x = torch.rand(1, len(param_names), dtype=dtype)
+        else:
+            fit_x = train_x[ok]
+            fit_y = -train_y[ok]          # BoTorch maximizes
 
-        model = SingleTaskGP(train_x, neg_train_y, covar_module=kernel,
-                            likelihood=likelihood)
-        model.covar_module.outputscale = torch.tensor(1.0, dtype=dtype)
-        model.covar_module.base_kernel.lengthscale = torch.tensor(0.2, dtype=dtype)
-        model.likelihood.noise = torch.tensor(1e-2, dtype=dtype)
+            kernel = ScaleKernel(
+                RBFKernel(ard_num_dims=len(param_names),
+                          lengthscale_constraint=GreaterThan(1e-3)),
+                outputscale_constraint=GreaterThan(1e-3))
+            likelihood = GaussianLikelihood(noise_constraint=GreaterThan(1e-4))
 
-        mll = ExactMarginalLogLikelihood(model.likelihood, model)
-        fit_gpytorch_model_with_adam(mll)
+            # Standardize keeps the hyperparameter initialization below on a
+            # sensible scale and silences BoTorch's InputDataWarning.
+            model = SingleTaskGP(fit_x, fit_y, covar_module=kernel,
+                                likelihood=likelihood,
+                                outcome_transform=Standardize(m=1))
+            model.covar_module.outputscale = torch.tensor(1.0, dtype=dtype)
+            model.covar_module.base_kernel.lengthscale = torch.tensor(0.2, dtype=dtype)
+            model.likelihood.noise = torch.tensor(1e-2, dtype=dtype)
 
-        acq_func = qLogExpectedImprovement(model=model, best_f=neg_train_y.max())
-        new_x, _ = optimize_acqf(acq_func, bounds=bounds, q=1,
-                                 num_restarts=5, raw_samples=20)
+            mll = ExactMarginalLogLikelihood(model.likelihood, model)
+            fit_gpytorch_model_with_adam(mll)
+
+            print(f"  fitting GP on {n_ok}/{len(train_y)} successful evaluations")
+            acq_func = qLogExpectedImprovement(model=model, best_f=fit_y.max())
+            new_x, _ = optimize_acqf(acq_func, bounds=bounds, q=1,
+                                     num_restarts=5, raw_samples=20)
 
         new_x_physical = scale_to_range(new_x, target_mins, target_maxs)
         y_values = []
         for x_physical in new_x_physical:
             print('Inputs: ', x_physical)
-            y_values.append([objective(Experiment_Name, 0, i, param_names,
+            y_values.append([objective(run_dir, 0, i, param_names,
                                        *x_physical, exp_saxs=exp_saxs,
                                        exp_dls=exp_dls)])
         new_y = torch.tensor(y_values, dtype=dtype)
@@ -977,11 +1718,14 @@ def run_optimization(Experiment_Name='20_Bridge_250803', n_iters=100,
 
         best_score_lst.append(train_y[best_idx].item())
 
-        pd.DataFrame(
+        evals = pd.DataFrame(
             np.hstack([scale_to_range(train_x, target_mins, target_maxs).numpy(),
                        train_y.numpy()]),
-            columns=param_names + ['score']).to_csv(
-            os.path.join(results_dir, 'all_evaluations.csv'), index=False)
+            columns=param_names + ['score'])
+        if 'gap' in evals.columns:
+            evals['n_derived'] = evals['m'] + evals['gap']
+        evals['status'] = np.where(evals['score'] == FAILED_SCORE, 'failed', 'ok')
+        evals.to_csv(os.path.join(results_dir, 'all_evaluations.csv'), index=False)
 
         fig, ax = plt.subplots(figsize=(7, 7))
         ax.plot(np.arange(len(best_score_lst)), best_score_lst, linewidth=3)
@@ -1019,8 +1763,6 @@ def check_scoring(root=_ROOT, out_dir=None, n_sim=25):
     saxs_files = sorted(glob.glob(os.path.join(saxs_dir, '*.npy')))[:n_sim]
     sim_saxs = [np.load(f) for f in saxs_files]
     print(f"Simulated SAXS series: {len(sim_saxs)} curves")
-    saxs_score, saxs_path, _ = score_series(
-        exp_saxs, sim_saxs, shape_distance_saxs, out_dir, 'saxs')
 
     # --- Simulated DLS series from the OVITO cluster exports ---
     dls_dir = os.path.join(root, 'Data', 'DLS', 'Simulated_DLS_10')
@@ -1028,14 +1770,24 @@ def check_scoring(root=_ROOT, out_dir=None, n_sim=25):
     sim_dls = [dls_distribution_from_clusters(clusters_from_ovito_file(f))
                for f in dls_files]
     print(f"Simulated DLS series: {len(sim_dls)} curves")
-    dls_score, dls_path, _ = score_series(
-        exp_dls, sim_dls, shape_distance_dls, out_dir, 'dls')
 
-    combined = SAXS_WEIGHT * saxs_score + DLS_WEIGHT * dls_score
-    print(f"\nCombined objective = {SAXS_WEIGHT} * {saxs_score:.4f} + "
-          f"{DLS_WEIGHT} * {dls_score:.4f} = {combined:.4f}")
+    n = min(len(sim_saxs), len(sim_dls))
+    sim_saxs, sim_dls = sim_saxs[:n], sim_dls[:n]
+
+    grid = build_time_grid(len(exp_saxs), len(exp_dls))
+    both = sum(1 for _, i, j in grid if i is not None and j is not None)
+    print(f"\nTime grid: {len(grid)} points from "
+          f"{grid[0][0]:.0f} to {grid[-1][0]:.0f} min "
+          f"({both} carry SAXS + DLS, {len(grid) - both} DLS only)")
+    print("NOTE: these two stored series come from different runs, so the joint "
+          "score is only a structural check, not a physical result.")
+
+    score, path, info = score_series_joint(
+        exp_saxs, exp_dls, sim_saxs, sim_dls, out_dir, time_grid=grid)
+
+    print(f"\nJoint objective = {score:.4f}")
     print(f"Plots and cost matrices written to {out_dir}")
-    return combined
+    return score
 
 
 # %%

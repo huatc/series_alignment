@@ -1,0 +1,2 @@
+started,n_iters,n_init,param_names,target_mins,target_maxs,N_SERIES_FRAMES,N_EDGE_FRAMES,saxs_weight,dls_weight,hoomd_mode
+2026-08-13 18:35:26,20,3,Density U_0 r0 m gap,5e-05 0.1 2.2 1.0 2.0,0.005 300.0 2.3 30.0 30.0,75,20,1,0,--mode=cpu

@@ -1,3 +1,12 @@
 **/md_whole.xtc
 **/npt.xtc
 **/nvt.xtc
+__pycache__/
+*.pyc
+
+# GROMACS run directories (83 GB of trajectories/checkpoints - too large for git)
+Data/QENS/Lysozyme_AMBER99SB-ILDN/
+Data/QENS/Lysozyme_CHARMM27/
+Data/QENS/Moringa/
+*.xtc
+*.trr
